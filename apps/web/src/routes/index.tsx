@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { Link, createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { DictationDemo } from "../components/DictationDemo";
 import { Mark } from "../components/Mark";
@@ -134,6 +134,20 @@ function Landing() {
       <footer className="border-t border-white/8">
         <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-2 px-6 py-6 text-xs text-bone-dim">
           <span>© 2026 Left Shift Logical, LLC</span>
+          <span className="flex gap-4">
+            <Link
+              to="/support"
+              className="text-amber-dim transition-colors hover:text-amber"
+            >
+              Support
+            </Link>
+            <Link
+              to="/privacy"
+              className="text-amber-dim transition-colors hover:text-amber"
+            >
+              Privacy
+            </Link>
+          </span>
           <span>
             Built on{" "}
             <a
