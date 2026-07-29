@@ -1,0 +1,282 @@
+import CoreAudio
+import Foundation
+
+/// Watches which processes are capturing the microphone via the CoreAudio
+/// process-object API (macOS 14.4+) and decides when a meeting starts and
+/// ends. A known meeting app capturing the mic for 3 continuous seconds is a
+/// meeting; the meeting is over when it releases the mic for 15 seconds.
+/// Browsers capturing the mic imply a web meeting (Google Meet has no native
+/// app) but only ever "ask" - a mic-using tab could be anything.
+@MainActor
+final class MeetingDetector {
+    enum Policy: String {
+        case auto, ask, never
+    }
+
+    /// A meeting app started capturing and policy says record automatically.
+    var onAutoStart: ((String) -> Void)?
+    /// An app started capturing and policy says ask first.
+    var onAsk: ((String) -> Void)?
+    /// The app that triggered the current meeting released the mic.
+    var onMeetingEnd: (() -> Void)?
+
+    private static let startDebounce: TimeInterval = 3
+    private static let endDebounce: TimeInterval = 15
+
+    /// Native meeting apps that default to auto-record.
+    private static let meetingApps: Set<String> = [
+        "us.zoom.xos",
+        "com.microsoft.teams2",
+        "com.microsoft.teams",
+        "com.cisco.webexmeetingsapp",
+        "Cisco-Systems.Spark",
+        "com.tinyspeck.slackmacgap",
+        "com.hnc.Discord",
+        "com.apple.FaceTime",
+    ]
+
+    /// Browser bundle-id prefixes that default to ask-first.
+    private static let browserPrefixes: [String] = [
+        "com.google.Chrome",
+        "com.apple.Safari",
+        "org.mozilla.firefox",
+        "company.thebrowser.Browser",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera",
+    ]
+
+    private static let enabledKey = "meetingAutoDetect"
+    private static let policiesKey = "meetingAppPolicies"
+
+    static var isEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: enabledKey) }
+    }
+
+    /// Effective policy for a bundle id: user override first, then the
+    /// built-in lists, then never.
+    static func policy(for bundleID: String) -> Policy {
+        let overrides = UserDefaults.standard.dictionary(forKey: policiesKey) as? [String: String]
+        if let raw = overrides?[bundleID], let policy = Policy(rawValue: raw) {
+            return policy
+        }
+        if meetingApps.contains(bundleID) { return .auto }
+        if browserPrefixes.contains(where: { bundleID.hasPrefix($0) }) { return .ask }
+        return .never
+    }
+
+    static func setPolicy(_ policy: Policy, for bundleID: String) {
+        var overrides =
+            UserDefaults.standard.dictionary(forKey: policiesKey) as? [String: String] ?? [:]
+        overrides[bundleID] = policy.rawValue
+        UserDefaults.standard.set(overrides, forKey: policiesKey)
+    }
+
+    /// Bundle ids worth offering policy control for in the UI.
+    static var knownApps: [String] {
+        (Array(meetingApps) + browserPrefixes).sorted()
+    }
+
+    private var listenerQueue = DispatchQueue(label: "com.leftshift.grumble.mic-watch")
+    private var listenerBlock: AudioObjectPropertyListenerBlock?
+    private var listenedProcesses: Set<AudioObjectID> = []
+    private var startTask: Task<Void, Never>?
+    private var endTask: Task<Void, Never>?
+    /// The bundle id whose capture started the current meeting; sticky until
+    /// the end debounce fires so brief mute/unmute cycles don't split one
+    /// meeting into many.
+    private(set) var activeMeetingBundleID: String?
+    /// Bundle ids already asked about this capture session, so one "ask"
+    /// notification doesn't repeat every property change.
+    private var asked: Set<String> = []
+
+    func start() {
+        guard listenerBlock == nil else { return }
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            Task { @MainActor in self?.refresh() }
+        }
+        listenerBlock = block
+        var address = Self.address(kAudioHardwarePropertyProcessObjectList)
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address, listenerQueue, block)
+        refresh()
+    }
+
+    func stop() {
+        if let listenerBlock {
+            var address = Self.address(kAudioHardwarePropertyProcessObjectList)
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &address, listenerQueue, listenerBlock)
+            var inputAddress = Self.address(kAudioProcessPropertyIsRunningInput)
+            for process in listenedProcesses {
+                AudioObjectRemovePropertyListenerBlock(
+                    process, &inputAddress, listenerQueue, listenerBlock)
+            }
+        }
+        listenerBlock = nil
+        listenedProcesses = []
+        startTask?.cancel()
+        endTask?.cancel()
+    }
+
+    /// Re-evaluate who is capturing the mic and drive the state machine.
+    private func refresh() {
+        guard let listenerBlock else { return }
+
+        let processes = Self.processObjects()
+
+        // Keep an IsRunningInput listener on every live process object so
+        // capture starts and stops wake us without polling.
+        var inputAddress = Self.address(kAudioProcessPropertyIsRunningInput)
+        let current = Set(processes)
+        for process in current.subtracting(listenedProcesses) {
+            AudioObjectAddPropertyListenerBlock(
+                process, &inputAddress, listenerQueue, listenerBlock)
+        }
+        listenedProcesses = current
+
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        var capturing: Set<String> = []
+        for process in processes {
+            guard Self.isRunningInput(process), Self.pid(of: process) != ownPID,
+                let bundleID = Self.bundleID(of: process), !bundleID.isEmpty
+            else { continue }
+            capturing.insert(bundleID)
+        }
+
+        asked.formIntersection(capturing)
+
+        if let active = activeMeetingBundleID {
+            if capturing.contains(active) {
+                endTask?.cancel()
+                endTask = nil
+            } else if endTask == nil {
+                endTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(Self.endDebounce * 1_000_000_000))
+                    guard let self, !Task.isCancelled else { return }
+                    self.endTask = nil
+                    self.activeMeetingBundleID = nil
+                    self.onMeetingEnd?()
+                }
+            }
+            return
+        }
+
+        guard Self.isEnabled else { return }
+
+        let autoCandidate = capturing.first { Self.policy(for: $0) == .auto }
+        let askCandidate = capturing.first { Self.policy(for: $0) == .ask && !asked.contains($0) }
+        guard autoCandidate != nil || askCandidate != nil else {
+            startTask?.cancel()
+            startTask = nil
+            return
+        }
+        guard startTask == nil else { return }
+
+        startTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.startDebounce * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            self.startTask = nil
+
+            // Re-check after the debounce: the capture must still be live.
+            let stillCapturing = Self.currentlyCapturingBundleIDs(excludingPID: ownPID)
+            if let auto = stillCapturing.first(where: { Self.policy(for: $0) == .auto }) {
+                self.activeMeetingBundleID = auto
+                self.onAutoStart?(auto)
+            } else if let ask = stillCapturing.first(where: {
+                Self.policy(for: $0) == .ask && !self.asked.contains($0)
+            }) {
+                self.asked.insert(ask)
+                self.onAsk?(ask)
+            }
+        }
+    }
+
+    /// Called by the controller when the user accepts an "ask" prompt or
+    /// starts recording manually while an app is capturing, so end detection
+    /// tracks that app.
+    func adoptMeeting(bundleID: String?) {
+        activeMeetingBundleID = bundleID
+        endTask?.cancel()
+        endTask = nil
+    }
+
+    /// The app most plausibly hosting a meeting right now, for tagging
+    /// manual recordings.
+    static func currentMeetingApp() -> String? {
+        let capturing = currentlyCapturingBundleIDs(
+            excludingPID: ProcessInfo.processInfo.processIdentifier)
+        return capturing.first { policy(for: $0) == .auto }
+            ?? capturing.first { policy(for: $0) == .ask }
+    }
+
+    // MARK: - CoreAudio property plumbing
+
+    private static func address(_ selector: AudioObjectPropertySelector)
+        -> AudioObjectPropertyAddress
+    {
+        AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+    }
+
+    private static func currentlyCapturingBundleIDs(excludingPID: Int32) -> Set<String> {
+        var out: Set<String> = []
+        for process in processObjects() {
+            guard isRunningInput(process), pid(of: process) != excludingPID,
+                let bundleID = bundleID(of: process), !bundleID.isEmpty
+            else { continue }
+            out.insert(bundleID)
+        }
+        return out
+    }
+
+    private static func processObjects() -> [AudioObjectID] {
+        var address = address(kAudioHardwarePropertyProcessObjectList)
+        var size: UInt32 = 0
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        guard AudioObjectGetPropertyDataSize(system, &address, 0, nil, &size) == noErr else {
+            return []
+        }
+        let count = Int(size) / MemoryLayout<AudioObjectID>.size
+        var list = [AudioObjectID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(system, &address, 0, nil, &size, &list) == noErr else {
+            return []
+        }
+        return list
+    }
+
+    private static func isRunningInput(_ process: AudioObjectID) -> Bool {
+        var address = address(kAudioProcessPropertyIsRunningInput)
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(process, &address, 0, nil, &size, &value) == noErr else {
+            return false
+        }
+        return value != 0
+    }
+
+    private static func bundleID(of process: AudioObjectID) -> String? {
+        var address = address(kAudioProcessPropertyBundleID)
+        var value: CFString = "" as CFString
+        var size = UInt32(MemoryLayout<CFString>.size)
+        guard AudioObjectGetPropertyData(process, &address, 0, nil, &size, &value) == noErr else {
+            return nil
+        }
+        return value as String
+    }
+
+    private static func pid(of process: AudioObjectID) -> Int32 {
+        var address = address(kAudioProcessPropertyPID)
+        var value: Int32 = -1
+        var size = UInt32(MemoryLayout<Int32>.size)
+        guard AudioObjectGetPropertyData(process, &address, 0, nil, &size, &value) == noErr else {
+            return -1
+        }
+        return value
+    }
+}

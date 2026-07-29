@@ -12,9 +12,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let hotKey = HotKeyManager()
     private let dictation = DictationController()
+    private let meetings = MeetingsController()
+    private lazy var meetingsWindow = MeetingsWindowController(controller: meetings)
 
     private var stateItem: NSMenuItem!
     private var toggleItem: NSMenuItem!
+    private var meetingStateItem: NSMenuItem!
+    private var meetingToggleItem: NSMenuItem!
+    private var meetingDiscardItem: NSMenuItem!
+    private var autoRecordItem: NSMenuItem!
+    private var meetingTimer: Timer?
     private var loginItem: NSMenuItem!
     private var modelMenu: NSMenu!
     private lazy var overlay = OverlayController()
@@ -49,6 +56,108 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hotKeyRegistered = true
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Utility mode for scripted checks of the system-audio TCC grant
+        // (also used to verify the sandboxed build can create process taps).
+        if CommandLine.arguments.contains("--probe-system-audio") {
+            let granted = SystemTrackRecorder.probeAccess()
+            print("system-audio-probe: \(granted ? "granted" : "denied")")
+            exit(granted ? 0 : 1)
+        }
+
+        // Utility mode: record a short live meeting session (both tracks),
+        // run it through the full pipeline, and print the result. Exercises
+        // capture and processing without any UI.
+        if let idx = CommandLine.arguments.firstIndex(of: "--record-test"),
+            let seconds = CommandLine.arguments.indices.contains(idx + 1)
+                ? Int(CommandLine.arguments[idx + 1]) : nil
+        {
+            Task { @MainActor in
+                do {
+                    let session = try MeetingSession(sourceBundleID: nil)
+                    try session.start()
+                    print("record-test: capturing \(seconds)s into \(session.dir.path)")
+                    try await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
+                    session.stop()
+                    let store = try MeetingStore()
+                    let pipeline = MeetingPipeline(store: store)
+                    await pipeline.enqueue(audioDir: session.dir.lastPathComponent)
+                    while (try? store.meeting(audioDir: session.dir.lastPathComponent))??
+                        .state != .done
+                    {
+                        if let m = try? store.meeting(audioDir: session.dir.lastPathComponent),
+                            m.state == .failed
+                        {
+                            print("record-test: FAILED \(m.errorMessage ?? "")")
+                            exit(1)
+                        }
+                        try await Task.sleep(nanoseconds: 1_000_000_000)
+                    }
+                    if let meeting = try store.meeting(audioDir: session.dir.lastPathComponent),
+                        let id = meeting.id
+                    {
+                        for segment in try store.segments(meetingId: id) {
+                            let speakers = try store.speakers(meetingId: id)
+                            let slot =
+                                speakers.first { $0.id == segment.speakerId }?.slot ?? "?"
+                            print("record-test: [\(slot)] \(segment.text)")
+                        }
+                    }
+                    print("record-test: done")
+                    exit(0)
+                } catch {
+                    print("record-test: error \(error)")
+                    exit(1)
+                }
+            }
+            return
+        }
+
+        // Utility mode: run the summarizer over an existing meeting and
+        // print the result (downloads the model on first use).
+        if let idx = CommandLine.arguments.firstIndex(of: "--summarize-meeting"),
+            let meetingId = CommandLine.arguments.indices.contains(idx + 1)
+                ? Int64(CommandLine.arguments[idx + 1]) : nil
+        {
+            Task { @MainActor in
+                do {
+                    let store = try MeetingStore()
+                    let pipeline = MeetingPipeline(store: store)
+                    let manager = SummarizerManager.shared
+                    manager.onReady = { summarizer in
+                        Task {
+                            await pipeline.setSummarizer(summarizer)
+                            await pipeline.summarize(meetingId: meetingId)
+                            if let meeting = try? store.meeting(id: meetingId) {
+                                print("title: \(meeting.title ?? "-")")
+                                print("summary: \(meeting.summary ?? "-")")
+                            }
+                            for speaker in (try? store.speakers(meetingId: meetingId)) ?? [] {
+                                print(
+                                    "speaker \(speaker.slot): \(speaker.displayName ?? "-") (\(speaker.namedBy ?? "-"))"
+                                )
+                            }
+                            exit(0)
+                        }
+                    }
+                    manager.install()
+                    while true {
+                        try await Task.sleep(nanoseconds: 5_000_000_000)
+                        if case .downloading(let f) = manager.state {
+                            print(String(format: "model download: %.0f%%", f * 100))
+                        }
+                        if case .failed(let message) = manager.state {
+                            print("summarize: FAILED \(message)")
+                            exit(1)
+                        }
+                    }
+                } catch {
+                    print("summarize: error \(error)")
+                    exit(1)
+                }
+            }
+            return
+        }
+
         // A DMG install and a dev build would otherwise both grab the hotkey
         // and both type into the focused field.
         let ownPID = ProcessInfo.processInfo.processIdentifier
@@ -110,6 +219,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 "Secure field \u{2014} dictation unavailable", color: .grumbleNeedle)
         }
 
+        meetings.onStateChange = { [weak self] _ in
+            self?.refreshMeetingUI()
+        }
+        meetings.onActivity = {
+            NotificationCenter.default.post(name: .grumbleMeetingsChanged, object: nil)
+        }
+
         // Launch at login defaults to on; register once so turning it off
         // later sticks.
         let defaultedKey = "didDefaultLaunchAtLogin"
@@ -138,6 +254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        autoRecordItem.state = MeetingDetector.isEnabled ? .on : .off
     }
 
     private func buildMenu() -> NSMenu {
@@ -155,6 +272,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         toggleItem.target = self
         menu.addItem(toggleItem)
+
+        menu.addItem(.separator())
+
+        meetingStateItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        meetingStateItem.isEnabled = false
+        meetingStateItem.isHidden = true
+        menu.addItem(meetingStateItem)
+
+        meetingToggleItem = NSMenuItem(
+            title: "Record Meeting", action: #selector(toggleMeetingRecording), keyEquivalent: "")
+        meetingToggleItem.target = self
+        menu.addItem(meetingToggleItem)
+
+        meetingDiscardItem = NSMenuItem(
+            title: "Discard Recording", action: #selector(discardMeetingRecording),
+            keyEquivalent: "")
+        meetingDiscardItem.target = self
+        meetingDiscardItem.isHidden = true
+        menu.addItem(meetingDiscardItem)
+
+        let meetingsItem = NSMenuItem(
+            title: "Meetings\u{2026}", action: #selector(openMeetings), keyEquivalent: "")
+        meetingsItem.target = self
+        menu.addItem(meetingsItem)
+
+        autoRecordItem = NSMenuItem(
+            title: "Auto-Record Meetings", action: #selector(toggleAutoRecord), keyEquivalent: "")
+        autoRecordItem.target = self
+        menu.addItem(autoRecordItem)
 
         menu.addItem(.separator())
 
@@ -246,8 +392,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if let button = statusItem.button {
             button.image = .grumbleMenuBarMark
-            button.contentTintColor = tint
+            // A live meeting recording tints the mark red whenever dictation
+            // isn't coloring it - recording must never be invisible.
+            button.contentTintColor = (tint == nil && meetings.isRecording) ? .grumbleNeedle : tint
         }
+    }
+
+    private func refreshMeetingUI() {
+        switch meetings.state {
+        case .idle:
+            meetingTimer?.invalidate()
+            meetingTimer = nil
+            meetingStateItem.isHidden = true
+            meetingDiscardItem.isHidden = true
+            meetingToggleItem.title = "Record Meeting"
+        case .recording(let startedAt, let sourceBundleID):
+            meetingStateItem.isHidden = false
+            meetingDiscardItem.isHidden = false
+            meetingToggleItem.title = "Stop Recording"
+            let source = sourceBundleID.map(MeetingsController.appName(for:))
+            let updateElapsed = { [weak self] in
+                guard let self else { return }
+                let elapsed = Int(Date().timeIntervalSince(startedAt))
+                let stamp = String(format: "%d:%02d", elapsed / 60, elapsed % 60)
+                self.meetingStateItem.title =
+                    source.map { "Recording \($0)  \(stamp)" } ?? "Recording Meeting  \(stamp)"
+            }
+            updateElapsed()
+            meetingTimer?.invalidate()
+            meetingTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+                Task { @MainActor in updateElapsed() }
+            }
+        }
+        updateUI(for: lastState)
     }
 
     private func refreshModelCheckmarks() {
@@ -259,6 +436,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleDictation() {
         dictation.toggle()
+    }
+
+    @objc private func toggleMeetingRecording() {
+        meetings.toggleRecording()
+    }
+
+    @objc private func discardMeetingRecording() {
+        meetings.discardRecording()
+    }
+
+    @objc private func openMeetings() {
+        meetingsWindow.show()
+    }
+
+    @objc private func toggleAutoRecord() {
+        MeetingDetector.isEnabled.toggle()
     }
 
     @objc private func openSetup() {

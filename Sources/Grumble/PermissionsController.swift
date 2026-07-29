@@ -19,8 +19,10 @@ final class PermissionsController {
     private var activationObserver: NSObjectProtocol?
     private var micRow: PermissionRow!
     private var axRow: PermissionRow!
+    private var systemAudioRow: PermissionRow!
     private var hotKeyRow: PermissionRow!
     private var modelRow: PermissionRow!
+    private static let systemAudioGrantedKey = "systemAudioGranted"
     private var loginCheckbox: NSButton!
     private var statusHint: NSTextField!
     private var doneButton: NSButton!
@@ -86,6 +88,11 @@ final class PermissionsController {
             detail: "So Grumble can type into other apps — switch Grumble on in the list."
         ) { [weak self] in self?.axAction() }
 
+        systemAudioRow = PermissionRow(
+            title: "System audio",
+            detail: "So meeting recordings include the other participants. Optional — only used while recording a meeting."
+        ) { [weak self] in self?.systemAudioAction() }
+
         hotKeyRow = PermissionRow(
             title: "Hotkey",
             detail: ""
@@ -126,7 +133,8 @@ final class PermissionsController {
         bottomBar.translatesAutoresizingMaskIntoConstraints = false
 
         let stack = NSStackView(views: [
-            heading, blurb, micRow, axRow, modelRow, hotKeyRow, loginCheckbox, bottomBar,
+            heading, blurb, micRow, axRow, systemAudioRow, modelRow, hotKeyRow, loginCheckbox,
+            bottomBar,
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -148,6 +156,8 @@ final class PermissionsController {
             stack.widthAnchor.constraint(equalToConstant: 470),
             micRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
             axRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
+            systemAudioRow.trailingAnchor.constraint(
+                equalTo: content.trailingAnchor, constant: -28),
             modelRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
             hotKeyRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
             bottomBar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
@@ -193,6 +203,12 @@ final class PermissionsController {
             buttonTitle: micStatus == .notDetermined ? "Allow\u{2026}" : "Open Settings\u{2026}"
         )
         axRow.update(granted: AXIsProcessTrusted(), buttonTitle: "Open Settings\u{2026}")
+
+        if UserDefaults.standard.bool(forKey: Self.systemAudioGrantedKey) {
+            systemAudioRow.set(dotColor: .systemGreen, buttonTitle: nil)
+        } else {
+            systemAudioRow.set(dotColor: .grumbleAmber, buttonTitle: "Allow\u{2026}")
+        }
 
         let display = hotKeyDisplay?() ?? ""
         if hotKeyConflict?() == true {
@@ -291,6 +307,24 @@ final class PermissionsController {
         default:
             openSettings(
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+        }
+    }
+
+    /// Probing the tap triggers the one-time "System Audio Recording" TCC
+    /// prompt when the grant was never decided; when it was denied, the only
+    /// path is the System Settings pane.
+    private func systemAudioAction() {
+        DispatchQueue.global().async {
+            let granted = SystemTrackRecorder.probeAccess()
+            DispatchQueue.main.async { [weak self] in
+                UserDefaults.standard.set(granted, forKey: Self.systemAudioGrantedKey)
+                if !granted {
+                    self?.openSettings(
+                        "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture"
+                    )
+                }
+                self?.refresh()
+            }
         }
     }
 

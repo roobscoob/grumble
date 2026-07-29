@@ -2,7 +2,9 @@ name: Grumble
 options:
   bundleIdPrefix: com.leftshift
   deploymentTarget:
-    macOS: "14.0"
+    # 14.4 for the CoreAudio process-tap and process-list APIs that meeting
+    # capture and detection are built on.
+    macOS: "14.4"
   createIntermediateGroups: true
 
 packages:
@@ -14,6 +16,14 @@ packages:
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     from: "2.7.0"
+  GRDB:
+    url: https://github.com/groue/GRDB.swift
+    from: "7.0.0"
+  MLXSwiftExamples:
+    # MLXLLM/MLXLMCommon: local LLM inference for meeting titles, summaries,
+    # and speaker naming (Qwen3-4B, downloaded opt-in at first use).
+    url: https://github.com/ml-explore/mlx-swift-examples
+    from: "2.29.1"
 
 schemes:
   Grumble:
@@ -63,6 +73,9 @@ targets:
     dependencies:
       - package: FluidAudio
       - package: Sparkle
+      - package: GRDB
+      - package: MLXSwiftExamples
+        product: MLXLLM
     info:
       path: Resources/Info.plist
       properties:
@@ -71,9 +84,10 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSApplicationCategoryType: public.app-category.productivity
-        LSMinimumSystemVersion: "14.0"
+        LSMinimumSystemVersion: "14.4"
         LSUIElement: true
         NSMicrophoneUsageDescription: Grumble listens to your microphone to transcribe your speech into text.
+        NSAudioCaptureUsageDescription: Grumble records system audio during meetings so it can transcribe what other participants say. Nothing leaves your Mac.
         SUFeedURL: https://grumble.computer/desktop/darwin/appcast.xml
         SUEnableAutomaticChecks: true
         SUPublicEDKey: WArXB/9ipPXBqgStv95Sw1WxCFDvWy1FWAN4u/l5w8g=
@@ -98,6 +112,9 @@ targets:
         buildPhase: resources
     dependencies:
       - package: FluidAudio
+      - package: GRDB
+      - package: MLXSwiftExamples
+        product: MLXLLM
     info:
       path: Resources/InfoAppStore.plist
       properties:
@@ -106,9 +123,10 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSApplicationCategoryType: public.app-category.productivity
-        LSMinimumSystemVersion: "14.0"
+        LSMinimumSystemVersion: "14.4"
         LSUIElement: true
         NSMicrophoneUsageDescription: Grumble listens to your microphone to transcribe your speech into text.
+        NSAudioCaptureUsageDescription: Grumble records system audio during meetings so it can transcribe what other participants say. Nothing leaves your Mac.
         ITSAppUsesNonExemptEncryption: false
     settings:
       base:

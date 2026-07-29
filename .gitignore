@@ -10,3 +10,4 @@ dist/
 .env
 *.tsbuildinfo
 apps/web/src/routeTree.gen.ts
+build-appstore/

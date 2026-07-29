@@ -6,9 +6,14 @@ stop. All transcription happens on-device via
 [FluidAudio](https://github.com/FluidInference/FluidAudio) and NVIDIA's
 Parakeet models running on CoreML — no audio ever leaves your Mac.
 
+Grumble also records meetings: it detects when Zoom, Teams, or a browser
+meeting is using your microphone, records both sides of the call, and produces
+a speaker-tagged transcript with an optional local-LLM title and summary. See
+[Meetings](#meetings).
+
 ## Install
 
-Requires macOS 14+. Install with [Homebrew](https://brew.sh):
+Requires macOS 14.4+. Install with [Homebrew](https://brew.sh):
 
 ```sh
 brew install --cask fcjr/fcjr/grumble
@@ -61,9 +66,39 @@ read-only), so update by bumping the flake input (`nix flake update grumble`).
   When the model revises earlier words, only the changed suffix is
   backspaced and retyped.
 
+## Meetings
+
+Grumble can record meetings and turn them into speaker-tagged transcripts,
+entirely on-device:
+
+- **Detection** — when a meeting app (Zoom, Teams, Webex, Slack, Discord,
+  FaceTime) starts using the microphone, recording starts automatically.
+  Browsers (Google Meet lives there) ask first via a notification. Policies
+  are per-app and configurable from the Meetings window; recording can also
+  be started manually from the menu bar.
+- **Capture** — two tracks: your microphone (with Apple's echo canceller, so
+  speaker playback doesn't bleed in) and system audio via a CoreAudio process
+  tap (macOS 14.4+, needs the one-time System Audio Recording permission).
+  Audio lands in `~/Library/Application Support/Grumble/Meetings/`.
+- **Transcription** — after the meeting, each track is transcribed with the
+  offline Parakeet TDT model. The mic track is you; the system track is
+  diarized with NVIDIA's streaming Sortformer so each remote speaker gets
+  their own label. Everything is merged into one timeline in a local SQLite
+  database (GRDB, append-only migrations).
+- **Titles, summaries, and names** — optionally, a local Qwen3-4B model
+  (opt-in ~2.3 GB download on first use, via MLX) writes a title and summary
+  and names speakers from context clues. Auto-applied names are marked and
+  always editable; your edits are never overwritten.
+- **Browsing** — menu bar → Meetings… lists every meeting with full-text
+  search, per-speaker transcript with click-to-play audio, markdown export,
+  audio retention settings, and delete.
+
+Nothing about a meeting ever leaves your Mac: capture, diarization,
+transcription, and summarization all run locally.
+
 ## Building
 
-Requires macOS 14+, Xcode, [xcodegen](https://github.com/yonaskolb/XcodeGen),
+Requires macOS 14.4+, Xcode, [xcodegen](https://github.com/yonaskolb/XcodeGen),
 and [just](https://github.com/casey/just) (`brew install xcodegen just`).
 
 ```sh
