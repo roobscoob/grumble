@@ -46,14 +46,16 @@ final class MeetingSession {
         dir = candidate
     }
 
-    /// Start both tracks. If the mic fails after the system tap started, the
-    /// tap is torn down so a half-silent session never runs.
+    /// Start both tracks: mic first, then the system tap. The mic's
+    /// voice-processing unit reconfigures the audio system when it engages;
+    /// doing that after the tap's aggregate device is live can stall tap
+    /// delivery for seconds and silently clip the start of the meeting.
     func start() throws {
-        try system.start(writingTo: dir.appendingPathComponent("system.caf"))
+        try mic.start(writingTo: dir.appendingPathComponent("mic.caf"))
         do {
-            try mic.start(writingTo: dir.appendingPathComponent("mic.caf"))
+            try system.start(writingTo: dir.appendingPathComponent("system.caf"))
         } catch {
-            system.stop()
+            mic.stop()
             throw error
         }
     }
