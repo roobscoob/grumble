@@ -22,6 +22,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var meetingDiscardItem: NSMenuItem!
     private var autoRecordItem: NSMenuItem!
     private var meetingTimer: Timer?
+    private var iconTimer: Timer?
+    private var iconPhase: CGFloat = 0
     private var loginItem: NSMenuItem!
     private var modelMenu: NSMenu!
     private lazy var overlay = OverlayController()
@@ -391,11 +393,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             overlay.show("Finishing", color: .grumbleAmber, pulsing: false)
         }
         if let button = statusItem.button {
-            button.image = .grumbleMenuBarMark
-            // A live meeting recording tints the mark red whenever dictation
-            // isn't coloring it - recording must never be invisible.
-            button.contentTintColor = (tint == nil && meetings.isRecording) ? .grumbleNeedle : tint
+            // While a meeting records (and dictation isn't coloring the
+            // mark), the waveform ripples in amber - motion plus a bright
+            // tint, because a recording must never be invisible and the
+            // static needle-red read as near-black at menu bar size.
+            let recordingIndicator = tint == nil && meetings.isRecording
+            if recordingIndicator {
+                startIconAnimation()
+            } else {
+                stopIconAnimation()
+                button.image = .grumbleMenuBarMark
+                button.contentTintColor = tint
+            }
         }
+    }
+
+    private func startIconAnimation() {
+        guard iconTimer == nil else { return }
+        iconTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 12.0, repeats: true) {
+            [weak self] _ in
+            Task { @MainActor in
+                guard let self, let button = self.statusItem.button else { return }
+                self.iconPhase += 0.3
+                button.image = .grumbleMenuBarMark(phase: self.iconPhase)
+                // Gentle brightness pulse on top of the ripple, slower than
+                // the wave so it reads as breathing, not blinking.
+                let pulse = 0.75 + 0.25 * sin(self.iconPhase * 0.5)
+                button.contentTintColor = .grumbleAmber.withAlphaComponent(pulse)
+            }
+        }
+    }
+
+    private func stopIconAnimation() {
+        iconTimer?.invalidate()
+        iconTimer = nil
+        iconPhase = 0
     }
 
     private func refreshMeetingUI() {

@@ -34,7 +34,13 @@ extension NSAttributedString {
 extension NSImage {
     /// The settling-waveform mark as a menu bar template image, drawn in code
     /// so it stays crisp at any scale and adapts to menu bar appearance.
-    @MainActor static let grumbleMenuBarMark: NSImage = {
+    @MainActor static let grumbleMenuBarMark: NSImage = grumbleMenuBarMark(phase: nil)
+
+    /// The mark with the two waveforms mid-undulation. `phase` sweeps the
+    /// modulation along the waves so successive frames read as a traveling
+    /// ripple - the recording indicator animates through these. `nil` is the
+    /// resting mark.
+    @MainActor static func grumbleMenuBarMark(phase: CGFloat?) -> NSImage {
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
             func addQuad(_ path: NSBezierPath, cp: NSPoint, to end: NSPoint) {
                 let s = path.currentPoint
@@ -47,25 +53,48 @@ extension NSImage {
                 )
             }
 
+            /// Scale a control point's distance from its wave's centerline:
+            /// each peak breathes on its own beat, offset along the wave, so
+            /// the whole stroke appears to roll rather than throb.
+            func animated(_ cp: NSPoint, centerline: CGFloat, beat: Int) -> NSPoint {
+                guard let phase else { return cp }
+                let scale = 0.55 + 0.45 * sin(phase + CGFloat(beat) * .pi / 2)
+                return NSPoint(x: cp.x, y: centerline + (cp.y - centerline) * scale)
+            }
+
             NSColor.black.set()
 
             let grumble = NSBezierPath()
             grumble.lineWidth = 1.7
             grumble.lineCapStyle = .round
             grumble.move(to: NSPoint(x: 2.5, y: 13.5))
-            addQuad(grumble, cp: NSPoint(x: 4.1, y: 17.1), to: NSPoint(x: 5.75, y: 13.5))
-            addQuad(grumble, cp: NSPoint(x: 7.4, y: 10.3), to: NSPoint(x: 9, y: 13.5))
-            addQuad(grumble, cp: NSPoint(x: 10.6, y: 17.3), to: NSPoint(x: 12.25, y: 13.5))
-            addQuad(grumble, cp: NSPoint(x: 13.9, y: 10.7), to: NSPoint(x: 15.5, y: 13.5))
+            addQuad(
+                grumble, cp: animated(NSPoint(x: 4.1, y: 17.1), centerline: 13.5, beat: 0),
+                to: NSPoint(x: 5.75, y: 13.5))
+            addQuad(
+                grumble, cp: animated(NSPoint(x: 7.4, y: 10.3), centerline: 13.5, beat: 1),
+                to: NSPoint(x: 9, y: 13.5))
+            addQuad(
+                grumble, cp: animated(NSPoint(x: 10.6, y: 17.3), centerline: 13.5, beat: 2),
+                to: NSPoint(x: 12.25, y: 13.5))
+            addQuad(
+                grumble, cp: animated(NSPoint(x: 13.9, y: 10.7), centerline: 13.5, beat: 3),
+                to: NSPoint(x: 15.5, y: 13.5))
             grumble.stroke()
 
             let settling = NSBezierPath()
             settling.lineWidth = 1.7
             settling.lineCapStyle = .round
             settling.move(to: NSPoint(x: 2.5, y: 9))
-            addQuad(settling, cp: NSPoint(x: 4.4, y: 11), to: NSPoint(x: 6.3, y: 9))
-            addQuad(settling, cp: NSPoint(x: 8.2, y: 7.1), to: NSPoint(x: 10.1, y: 9))
-            addQuad(settling, cp: NSPoint(x: 12, y: 10.9), to: NSPoint(x: 13.9, y: 9))
+            addQuad(
+                settling, cp: animated(NSPoint(x: 4.4, y: 11), centerline: 9, beat: 2),
+                to: NSPoint(x: 6.3, y: 9))
+            addQuad(
+                settling, cp: animated(NSPoint(x: 8.2, y: 7.1), centerline: 9, beat: 3),
+                to: NSPoint(x: 10.1, y: 9))
+            addQuad(
+                settling, cp: animated(NSPoint(x: 12, y: 10.9), centerline: 9, beat: 4),
+                to: NSPoint(x: 13.9, y: 9))
             settling.stroke()
 
             let sentence = NSBezierPath()
@@ -80,5 +109,5 @@ extension NSImage {
         }
         image.isTemplate = true
         return image
-    }()
+    }
 }
