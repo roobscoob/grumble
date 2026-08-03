@@ -27,6 +27,10 @@ actor MeetingPipeline {
     /// Fired on every meeting state change so the menu can reflect progress.
     var onActivity: (@Sendable () -> Void)?
 
+    /// The session being processed, for stage reporting.
+    private var currentDir: String?
+    private var currentAudioSeconds: Double = 0
+
     init(store: MeetingStore) {
         self.store = store
     }
@@ -74,9 +78,13 @@ actor MeetingPipeline {
     func summarize(meetingId: Int64) async {
         guard let summarizer, let meeting = try? store.meeting(id: meetingId) else { return }
         try? store.setState(audioDir: meeting.audioDir, .summarizing)
+        currentDir = meeting.audioDir
+        currentAudioSeconds = Double(meeting.durationSeconds)
+        report(.summarizing)
         onActivity?()
         await runSummarizer(summarizer, meeting: meeting)
         try? store.setState(audioDir: meeting.audioDir, .done)
+        report(nil)
         onActivity?()
     }
 
@@ -96,11 +104,35 @@ actor MeetingPipeline {
                 try? store.setState(
                     audioDir: dir, .failed, error: error.localizedDescription)
             }
+            report(nil)
             onActivity?()
         }
         releaseModels()
         draining = false
+        report(nil)
         onActivity?()
+    }
+
+    /// Publish the current stage to the UI. Passing nil clears it.
+    ///
+    /// Also logged: post-processing is a long background job with several
+    /// stages that can each stall on something outside the app (a model
+    /// download, say), and without a trace of where it got to, a stuck run is
+    /// indistinguishable from a slow one.
+    private func report(_ stage: MeetingProgress.Stage?) {
+        guard let stage, let dir = currentDir else {
+            Task { @MainActor in MeetingProgressCenter.shared.update(nil) }
+            return
+        }
+        NSLog("Grumble: meeting \(dir) stage: \(stage)")
+        MeetingTrace.write("stage \(stage) [\(dir)]")
+        let progress = MeetingProgress(
+            audioDir: dir,
+            stage: stage,
+            stageStartedAt: Date(),
+            audioSeconds: currentAudioSeconds
+        )
+        Task { @MainActor in MeetingProgressCenter.shared.update(progress) }
     }
 
     private func process(audioDir: String) async throws {
@@ -123,21 +155,35 @@ actor MeetingPipeline {
         meeting.endedAt = meta.ended
         meeting.state = .transcribing
         try store.update(meeting)
+        currentDir = audioDir
+        currentAudioSeconds = Double(meta.durationSeconds)
         onActivity?()
 
+        report(.transcribing(track: 1, of: 2))
         let manager = try await loadAsr()
 
         let micOffsetMs = meta.startOffsetMs["mic"] ?? 0
         let systemOffsetMs = meta.startOffsetMs["system"] ?? 0
+        let micStarted = Date()
         let micSegments = try await transcribeTrack(
             dir.appendingPathComponent("mic.caf"), with: manager)
+        MeetingThroughput.record(
+            audioSeconds: currentAudioSeconds, elapsed: Date().timeIntervalSince(micStarted))
+
+        report(.transcribing(track: 2, of: 2))
+        let systemStarted = Date()
         let systemSegments = try await transcribeTrack(
             dir.appendingPathComponent("system.caf"), with: manager)
+        MeetingThroughput.record(
+            audioSeconds: currentAudioSeconds, elapsed: Date().timeIntervalSince(systemStarted))
 
         // Diarize the system track. Failure degrades to a single remote
         // speaker rather than losing the meeting.
+        MeetingTrace.write(
+            "asr done: mic=\(micSegments.count) system=\(systemSegments.count) segments")
         var speakerSpans: [(slot: String, start: Double, end: Double)] = []
         if !systemSegments.isEmpty {
+            report(.diarizing)
             do {
                 let diarizer = try await loadDiarizer()
                 let timeline = try diarizer.processComplete(
@@ -189,6 +235,7 @@ actor MeetingPipeline {
 
         if let summarizer {
             try store.setState(audioDir: audioDir, .summarizing)
+            report(.summarizing)
             onActivity?()
             await runSummarizer(summarizer, meeting: meeting)
         }
@@ -237,15 +284,20 @@ actor MeetingPipeline {
 
     private func loadAsr() async throws -> AsrManager {
         if let asrManager { return asrManager }
+        // First use downloads the model, which on a slow link is by far the
+        // longest step here.
+        NSLog("Grumble: loading ASR model")
         let models = try await AsrModels.downloadAndLoad(version: .v2)
         let manager = AsrManager()
         try await manager.loadModels(models)
         asrManager = manager
+        NSLog("Grumble: ASR model ready")
         return manager
     }
 
     private func loadDiarizer() async throws -> SortformerDiarizer {
         if let diarizer { return diarizer }
+        NSLog("Grumble: loading diarizer")
         let models = try await SortformerModels.loadFromHuggingFace(config: .default)
         let newDiarizer = SortformerDiarizer(config: .default)
         newDiarizer.initialize(models: models)

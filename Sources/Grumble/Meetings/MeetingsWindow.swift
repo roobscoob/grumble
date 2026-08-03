@@ -274,6 +274,7 @@ struct MeetingsView: View {
 
 struct MeetingRow: View {
     let meeting: Meeting
+    @ObservedObject private var center = MeetingProgressCenter.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -301,7 +302,12 @@ struct MeetingRow: View {
             Label("Recording", systemImage: "record.circle")
                 .foregroundStyle(.red)
         case .queued, .transcribing:
-            Label("Transcribing", systemImage: "waveform")
+            if let progress = center.progress(for: meeting), let fraction = progress.fraction {
+                Label(
+                    "Transcribing \(Int(fraction * 100))%", systemImage: "waveform")
+            } else {
+                Label(meeting.state == .queued ? "Queued" : "Transcribing", systemImage: "waveform")
+            }
         case .summarizing:
             Label("Summarizing", systemImage: "sparkles")
         case .failed:
@@ -453,8 +459,14 @@ struct MeetingDetailView: View {
                 }
             }
             if model.segments.isEmpty {
-                Text(transcriptPlaceholder)
-                    .foregroundStyle(.secondary)
+                if meeting.state == .queued || meeting.state == .transcribing
+                    || meeting.state == .summarizing
+                {
+                    MeetingProgressView(meeting: meeting)
+                } else {
+                    Text(transcriptPlaceholder)
+                        .foregroundStyle(.secondary)
+                }
             }
             ForEach(model.segments) { segment in
                 SegmentRow(model: model, segment: segment)
@@ -470,6 +482,81 @@ struct MeetingDetailView: View {
         case .failed: return "No transcript."
         case .done: return "No speech was detected in this recording."
         }
+    }
+}
+
+/// Live post-processing status: which stage is running, how far through it
+/// is, and roughly how much longer. Falls back to an indeterminate bar with
+/// elapsed time when there is no basis for an estimate, and says so plainly
+/// when a stage has run far past expectations rather than sitting silent.
+struct MeetingProgressView: View {
+    let meeting: Meeting
+    @ObservedObject private var center = MeetingProgressCenter.shared
+    /// Redraws the estimate as it counts down; the progress model derives
+    /// everything from the stage start, so there is nothing else to poll.
+    @State private var now = Date()
+    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let progress = center.progress(for: meeting) {
+                HStack(spacing: 8) {
+                    Text(progress.label)
+                        .font(.callout.weight(.medium))
+                    Spacer()
+                    Text(remaining(progress))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                if let fraction = progress.fraction {
+                    ProgressView(value: fraction)
+                } else {
+                    ProgressView().progressViewStyle(.linear)
+                }
+                if progress.isStalled {
+                    Label(
+                        "This is taking much longer than expected. If it doesn't finish, "
+                            + "quit and reopen Grumble to retry.",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
+            } else {
+                // Queued behind another meeting, or the app restarted and
+                // has not picked this one back up yet.
+                HStack(spacing: 8) {
+                    Text(meeting.state == .summarizing ? "Summarizing" : "Waiting to transcribe")
+                        .font(.callout.weight(.medium))
+                    Spacer()
+                }
+                ProgressView().progressViewStyle(.linear)
+            }
+            Text("Everything runs on this Mac, so it depends on how busy your machine is.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+        .onReceive(tick) { now = $0 }
+    }
+
+    private func remaining(_ progress: MeetingProgress) -> String {
+        _ = now
+        if let seconds = progress.estimatedSecondsRemaining, seconds > 0 {
+            return "about \(Self.humanized(seconds)) left"
+        }
+        let elapsed = Date().timeIntervalSince(progress.stageStartedAt)
+        return "\(Self.humanized(elapsed)) elapsed"
+    }
+
+    static func humanized(_ seconds: Double) -> String {
+        let total = Int(seconds.rounded())
+        if total < 60 { return "\(max(total, 1))s" }
+        let minutes = total / 60
+        if minutes < 60 { return "\(minutes) min" }
+        return String(format: "%dh %02dm", minutes / 60, minutes % 60)
     }
 }
 
