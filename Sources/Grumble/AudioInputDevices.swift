@@ -15,6 +15,13 @@ enum AudioInputDevices {
     private static let uidDefaultsKey = "inputDeviceUID"
     private static let nameDefaultsKey = "inputDeviceName"
 
+    /// Enumerating the HAL is a synchronous round-trip to coreaudiod per
+    /// device per property, and this runs on every menu open and every
+    /// dictation start - a wedged driver would stall the menu bar. Cache the
+    /// scan and let the HAL say when it went stale.
+    private static var cache: [(id: AudioDeviceID, device: Device)]?
+    private static var invalidator: AudioObjectPropertyListenerBlock?
+
     /// The saved device, or nil for the system default.
     static var preferred: Device? {
         get {
@@ -41,22 +48,43 @@ enum AudioInputDevices {
     /// default devices) are implementation details, not user choices - only
     /// user-created aggregates are listed.
     static func available() -> [Device] {
-        allDeviceIDs().compactMap { id in
-            guard hasInput(id), !isPrivateAggregate(id),
-                let uid = stringProperty(id, kAudioDevicePropertyDeviceUID),
-                let name = stringProperty(id, kAudioObjectPropertyName)
-            else { return nil }
-            return Device(uid: uid, name: name)
-        }
+        devices().map(\.device)
     }
 
     /// AudioDeviceID for the saved choice, or nil when unset or currently
     /// disconnected (callers fall back to the system default).
     static func preferredDeviceID() -> AudioDeviceID? {
         guard let uid = preferred?.uid else { return nil }
-        return allDeviceIDs().first { id in
-            hasInput(id) && stringProperty(id, kAudioDevicePropertyDeviceUID) == uid
+        return devices().first { $0.device.uid == uid }?.id
+    }
+
+    private static func devices() -> [(id: AudioDeviceID, device: Device)] {
+        if let cache { return cache }
+        let scan = allDeviceIDs().compactMap { id -> (id: AudioDeviceID, device: Device)? in
+            guard hasInput(id), !isPrivateAggregate(id),
+                let uid = stringProperty(id, kAudioDevicePropertyDeviceUID),
+                let name = stringProperty(id, kAudioObjectPropertyName)
+            else { return nil }
+            return (id, Device(uid: uid, name: name))
         }
+        // Only hold on to the scan once the HAL can tell us it went stale.
+        if watchForDeviceChanges() { cache = scan }
+        return scan
+    }
+
+    private static func watchForDeviceChanges() -> Bool {
+        guard invalidator == nil else { return true }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let block: AudioObjectPropertyListenerBlock = { _, _ in cache = nil }
+        guard
+            AudioObjectAddPropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &address, .main, block) == noErr
+        else { return false }
+        invalidator = block
+        return true
     }
 
     private static func allDeviceIDs() -> [AudioDeviceID] {
