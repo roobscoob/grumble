@@ -322,6 +322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         micMenu = NSMenu()
         let micItem = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
+        micItem.toolTip = "Takes effect from the next dictation or recording."
         menu.setSubmenu(micMenu, for: micItem)
         menu.addItem(micItem)
         rebuildMicMenu()
@@ -495,9 +496,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             micMenu.addItem(item)
         }
         if let preferred, !sawPreferred {
+            // action: nil leaves it disabled under autoenablesItems.
             let item = NSMenuItem(
                 title: "\(preferred.name) (not connected)", action: nil, keyEquivalent: "")
-            item.isEnabled = false
             item.state = .on
             micMenu.addItem(item)
         }
