@@ -19,16 +19,29 @@ final class AudioCapture {
     /// are accumulated to the same 4096-frame cadence the old AVAudioEngine
     /// tap produced; per-slice delivery would make those resampling seams
     /// ~8x more frequent and audibly degrade the features the recognizer
-    /// sees. Levels still go out per slice, so the meter stays live.
+    /// sees. Levels ride the same cadence: the overlay meter animates over
+    /// 90 ms and would never settle if retargeted every slice.
     private static let chunkFrames: AVAudioFrameCount = 4096
+
+    /// Consecutive AudioUnitRender failures tolerated before the session is
+    /// ended. A device changing state can glitch a slice or two; a longer
+    /// run means capture is dead, and staying up would silently transcribe
+    /// nothing.
+    private static let renderFailureLimit = 16
 
     private var unit: AudioUnit?
     private var format: AVAudioFormat?
+    /// Reused across render callbacks so the IO thread doesn't allocate.
+    private var slice: AVAudioPCMBuffer?
     private var staging: AVAudioPCMBuffer?
+    private var renderFailures = 0
     private var onBuffer: ((AVAudioPCMBuffer) -> Void)?
     private var onLevel: ((Float) -> Void)?
     private var onConfigurationChange: (() -> Void)?
-    private var listeners: [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
+    private var listeners:
+        [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
+
+    deinit { stop() }
 
     func start(
         onBuffer: @escaping (AVAudioPCMBuffer) -> Void,
@@ -38,6 +51,7 @@ final class AudioCapture {
         self.onBuffer = onBuffer
         self.onLevel = onLevel
         self.onConfigurationChange = onConfigurationChange
+        renderFailures = 0
 
         let pinned = AudioInputDevices.preferredDeviceID()
         guard let device = pinned ?? Self.defaultInputDevice() else {
@@ -120,11 +134,16 @@ final class AudioCapture {
             throw error
         }
 
-        // End the session when the capture device disappears, and - when
-        // following the system default - when the default moves, so the next
-        // session picks up the new device (same contract as the old
-        // AVAudioEngineConfigurationChange handling).
+        // End the session when the capture device disappears or reconfigures
+        // - a rate or channel-layout change invalidates the client format
+        // negotiated above - and, when following the system default, when the
+        // default moves, so the next session picks up the new device. Same
+        // contract as the old AVAudioEngineConfigurationChange handling.
         listen(to: device, selector: kAudioDevicePropertyDeviceIsAlive)
+        listen(to: device, selector: kAudioDevicePropertyNominalSampleRate)
+        listen(
+            to: device, selector: kAudioDevicePropertyStreamConfiguration,
+            scope: kAudioObjectPropertyScopeInput)
         if pinned == nil {
             listen(
                 to: AudioObjectID(kAudioObjectSystemObject),
@@ -152,15 +171,26 @@ final class AudioCapture {
         _ inBusNumber: UInt32,
         _ inNumberFrames: UInt32
     ) -> OSStatus {
-        guard let unit, let format,
-            let slice = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: inNumberFrames)
-        else { return noErr }
+        guard let unit, let format else { return noErr }
+        // Allocates on the first callback, and again only if the device grows
+        // its IO slice; steady state reuses the buffer.
+        if (slice?.frameCapacity ?? 0) < inNumberFrames {
+            slice = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: inNumberFrames)
+        }
+        guard let slice else { return noErr }
         slice.frameLength = inNumberFrames
         let status = AudioUnitRender(
             unit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames,
             slice.mutableAudioBufferList)
-        guard status == noErr else { return status }
-        onLevel?(Self.level(of: slice))
+        guard status == noErr else {
+            renderFailures += 1
+            if renderFailures == Self.renderFailureLimit {
+                NSLog("Grumble: audio capture stalled (\(status)); ending session")
+                onConfigurationChange?()
+            }
+            return status
+        }
+        renderFailures = 0
         accumulate(slice)
         return noErr
     }
@@ -187,15 +217,19 @@ final class AudioCapture {
             copied += count
             if chunk.frameLength == Self.chunkFrames {
                 staging = nil
+                onLevel?(Self.level(of: chunk))
                 onBuffer?(chunk)
             }
         }
     }
 
-    private func listen(to id: AudioObjectID, selector: AudioObjectPropertySelector) {
+    private func listen(
+        to id: AudioObjectID, selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal
+    ) {
         var address = AudioObjectPropertyAddress(
             mSelector: selector,
-            mScope: kAudioObjectPropertyScopeGlobal,
+            mScope: scope,
             mElement: kAudioObjectPropertyElementMain)
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             self?.onConfigurationChange?()
@@ -216,6 +250,7 @@ final class AudioCapture {
         }
         unit = nil
         format = nil
+        slice = nil
         staging = nil
         onBuffer = nil
         onLevel = nil
